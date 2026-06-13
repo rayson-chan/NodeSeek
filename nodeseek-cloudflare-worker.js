@@ -1,30 +1,45 @@
-// NodeSeek 签到 Cloudflare Worker
-// 使用 2captcha 解决 Turnstile 验证码
+// NodeSeek 签到 Cloudflare Worker (支持双验证码平台 - 终极稳定版)
 //
 // 环境变量配置：
 // user: 用户名，多个账户用&分割，如：user1&user2
 // pass: 密码，多个密码用&分割，如：pass1&pass2（与user一一对应）
-// CAPTCHA_API_KEY: 2captcha API密钥 (必填)
-// CAPTCHA_API_URL: 2captcha API地址 (可选，默认 https://api.2captcha.com)
+// CAPTCHA_VENDOR: 验证码供应商，填 yescaptcha 或 2captcha (必填)
+// CAPTCHA_API_KEY: 对应平台的 API密钥 (必填)
+// CAPTCHA_API_URL: API地址 (可选，留空则根据供应商自动选择默认标准API)
 // NS_COOKIE: 已有的Cookie，多个用&分割（可选，如果提供则跳过登录）
 // BotToken: Telegram Bot Token（可选）
 // ChatID: Telegram Chat ID（可选，用于接收通知）
+// AUTH_TOKEN: 后台配置了 AUTH_TOKEN，则进行校验（可选）
 
 export default {
-  async fetch(request, env) {
-    return handleRequest(request, env);
+  async fetch(request, env, ctx) {
+    return handleRequest(request, env, ctx);
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(handleScheduled(env));
+    ctx.waitUntil(performCheckin(env));
   }
 };
 
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
 
   if (url.pathname === '/checkin' && request.method === 'POST') {
-    // 手动触发签到
+    // === 新增鉴权逻辑 ===
+    const expectedToken = env.AUTH_TOKEN;
+    // 如果你在后台配置了 AUTH_TOKEN，则进行校验
+    if (expectedToken && expectedToken.trim() !== '') {
+      const clientToken = request.headers.get('Authorization');
+      if (clientToken !== expectedToken) {
+        return new Response(JSON.stringify({ success: false, message: 'Unauthorized: 无效的鉴权 Token' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+    // ====================
+
+    // 鉴权通过，执行签到
     const result = await performCheckin(env);
     return new Response(JSON.stringify(result), {
       headers: { 'Content-Type': 'application/json' }
@@ -34,171 +49,166 @@ async function handleRequest(request, env) {
   return new Response('NodeSeek 签到服务运行中', { status: 200 });
 }
 
-async function handleScheduled(env) {
-  await performCheckin(env);
+// ==================== 统一验证码解决工厂 ====================
+class CaptchaSolverFactory {
+  static create(vendor, apiKey, apiUrl) {
+    const targetVendor = (vendor || '2captcha').toLowerCase().trim();
+    
+    if (targetVendor === 'yescaptcha') {
+      return new YesCaptchaSolver(apiKey, apiUrl || 'https://api.yescaptcha.com');
+    } else if (targetVendor === '2captcha') {
+      return new TwoCaptchaSolver(apiKey, apiUrl || 'https://api.2captcha.com');
+    } else {
+      throw new Error(`未知的验证码供应商: ${vendor}，仅支持 yescaptcha 或 2captcha`);
+    }
+  }
 }
 
 // ==================== 2captcha 验证码解决器 ====================
-
 class TwoCaptchaSolver {
-  constructor(apiKey, apiBaseUrl = 'https://api.2captcha.com') {
+  constructor(apiKey, apiBaseUrl) {
     this.apiKey = apiKey;
     this.createTaskUrl = `${apiBaseUrl}/createTask`;
     this.getResultUrl = `${apiBaseUrl}/getTaskResult`;
-    this.maxRetries = 40; // 最大重试次数（2分钟）
-    this.retryInterval = 3000; // 重试间隔（3秒）
+    this.maxRetries = 40;
+    this.retryInterval = 3000;
   }
 
-  /**
-   * 解决 Turnstile 验证码
-   * @param {string} url - 网站URL
-   * @param {string} sitekey - 网站密钥
-   * @returns {Promise<string>} 验证令牌
-   */
   async solve(url, sitekey) {
-    try {
-      console.log('开始创建验证码任务...');
-      const taskId = await this._createTask(url, sitekey);
-
-      if (!taskId) {
-        throw new Error('创建任务失败：未返回任务ID');
-      }
-
-      console.log(`任务已创建，ID: ${taskId}`);
-      console.log('等待验证码解决...');
-
-      const token = await this._getTaskResult(taskId);
-      console.log('✅ 验证码解决成功');
-
-      return token;
-    } catch (error) {
-      console.error(`❌ 验证码解决失败: ${error.message}`);
-      throw error;
-    }
+    console.log('开始创建 2captcha 验证码任务...');
+    const taskId = await this._createTask(url, sitekey);
+    if (!taskId) throw new Error('2captcha 创建任务失败：未返回任务ID');
+    console.log(`任务已创建，ID: ${taskId}，等待解决...`);
+    return await this._getTaskResult(taskId);
   }
 
-  /**
-   * 创建验证码任务
-   */
   async _createTask(url, sitekey) {
     const data = {
       clientKey: this.apiKey,
-      task: {
-        type: 'TurnstileTaskProxyless',
-        websiteURL: url,
-        websiteKey: sitekey
-      },
-      softId: 0 // 可以设置为你的软件ID
+      task: { type: 'TurnstileTaskProxyless', websiteURL: url, websiteKey: sitekey }
     };
-
-    try {
-      const response = await fetch(this.createTaskUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(data)
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const result = await response.json();
-
-      if (result.errorId === 0) {
-        return result.taskId;
-      } else {
-        throw new Error(`API错误 (${result.errorId}): ${result.errorDescription || result.errorCode || '未知错误'}`);
-      }
-    } catch (error) {
-      if (error.message.includes('API错误')) {
-        throw error;
-      }
-      throw new Error(`创建任务请求失败: ${error.message}`);
-    }
+    const response = await fetch(this.createTaskUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const result = await response.json();
+    if (result.errorId === 0) return result.taskId;
+    throw new Error(`API错误 (${result.errorId}): ${result.errorDescription || result.errorCode || '未知错误'}`);
   }
 
-  /**
-   * 获取任务结果（轮询）
-   */
   async _getTaskResult(taskId) {
-    const data = {
-      clientKey: this.apiKey,
-      taskId: taskId
-    };
-
+    const data = { clientKey: this.apiKey, taskId: taskId };
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
         const response = await fetch(this.getResultUrl, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(data)
         });
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const result = await response.json();
-
-        if (result.errorId !== 0) {
-          throw new Error(`API错误 (${result.errorId}): ${result.errorDescription || result.errorCode || '未知错误'}`);
-        }
-
-        const status = result.status;
-
-        if (status === 'ready') {
+        if (result.errorId !== 0) throw new Error(`API错误 (${result.errorId}): ${result.errorDescription || '未知错误'}`);
+        
+        if (result.status === 'ready') {
           const token = result.solution?.token;
-          if (!token) {
-            throw new Error('解决成功但未返回令牌');
-          }
+          if (!token) throw new Error('解决成功但未返回令牌');
           return token;
-        } else if (status === 'processing') {
-          console.log(`[${attempt}/${this.maxRetries}] 验证码处理中...`);
-          await this._sleep(this.retryInterval);
+        } else if (result.status === 'processing') {
+          console.log(`[${attempt}/${this.maxRetries}] 2captcha 处理中...`);
+          await new Promise(resolve => setTimeout(resolve, this.retryInterval));
         } else {
-          throw new Error(`未知状态: ${status}`);
+          throw new Error(`未知状态: ${result.status}`);
         }
       } catch (error) {
-        if (error.message.includes('API错误') || error.message.includes('未知状态')) {
-          throw error;
-        }
-
-        if (attempt === this.maxRetries) {
-          throw new Error(`获取结果失败: ${error.message}`);
-        }
-
-        console.log(`获取结果请求失败，重试中... (${attempt}/${this.maxRetries})`);
-        await this._sleep(this.retryInterval);
+        if (error.message.includes('API错误') || error.message.includes('未知状态')) throw error;
+        if (attempt === this.maxRetries) throw new Error(`获取结果失败: ${error.message}`);
+        await new Promise(resolve => setTimeout(resolve, this.retryInterval));
       }
     }
+    throw new Error('2captcha 验证码解决超时');
+  }
+}
 
-    throw new Error(`验证码解决超时（已重试${this.maxRetries}次）`);
+// ==================== YesCaptcha 验证码解决器 ====================
+class YesCaptchaSolver {
+  constructor(apiKey, apiBaseUrl) {
+    this.apiKey = apiKey;
+    this.createTaskUrl = `${apiBaseUrl}/createTask`;
+    this.getResultUrl = `${apiBaseUrl}/getTaskResult`;
+    this.maxRetries = 40;
+    this.retryInterval = 3000;
   }
 
-  _sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  async solve(url, sitekey) {
+    console.log('开始创建 YesCaptcha 验证码任务...');
+    const taskId = await this._createTask(url, sitekey);
+    if (!taskId) throw new Error('YesCaptcha 创建任务失败：未返回任务ID');
+    console.log(`任务已创建，ID: ${taskId}，等待解决...`);
+    return await this._getTaskResult(taskId);
+  }
+
+  async _createTask(url, sitekey) {
+    const data = {
+      clientKey: this.apiKey,
+      task: { type: 'TurnstileTaskProxyless', websiteURL: url, websiteKey: sitekey }
+    };
+    const response = await fetch(this.createTaskUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const result = await response.json();
+    if (result.errorId === 0) return result.taskId;
+    throw new Error(`API错误 (${result.errorId}): ${result.errorDescription || '未知错误'}`);
+  }
+
+  async _getTaskResult(taskId) {
+    const data = { clientKey: this.apiKey, taskId: taskId };
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      try {
+        const response = await fetch(this.getResultUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data)
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const result = await response.json();
+        if (result.errorId !== 0) throw new Error(`API错误 (${result.errorId}): ${result.errorDescription || '未知错误' });
+        
+        if (result.status === 'ready') {
+          const token = result.solution?.token;
+          if (!token) throw new Error('解决成功但未返回令牌');
+          return token;
+        } else if (result.status === 'processing') {
+          console.log(`[${attempt}/${this.maxRetries}] YesCaptcha 处理中...`);
+          await new Promise(resolve => setTimeout(resolve, this.retryInterval));
+        } else {
+          throw new Error(`未知状态: ${result.status}`);
+        }
+      } catch (error) {
+        if (error.message.includes('API错误') || error.message.includes('未知状态')) throw error;
+        if (attempt === this.maxRetries) throw new Error(`获取结果失败: ${error.message}`);
+        await new Promise(resolve => setTimeout(resolve, this.retryInterval));
+      }
+    }
+    throw new Error('YesCaptcha 验证码解决超时');
   }
 }
 
 // ==================== NodeSeek 签到逻辑 ====================
-
-/**
- * 执行签到主流程
- */
 async function performCheckin(env) {
   const users = env.user || '';
   const passwords = env.pass || '';
+  const captchaVendor = env.CAPTCHA_VENDOR || '2captcha';
   const captchaApiKey = env.CAPTCHA_API_KEY || '';
-  const captchaApiUrl = env.CAPTCHA_API_URL || 'https://api.2captcha.com';
+  const captchaApiUrl = env.CAPTCHA_API_URL || '';
   const nsCookies = env.NS_COOKIE || '';
   const botToken = env.BotToken || '';
   const chatId = env.ChatID || '';
 
-  // 验证必要参数
   if (!users || !passwords) {
     const errorMsg = '❌ 未配置 user 或 pass 环境变量';
     console.error(errorMsg);
@@ -235,7 +245,6 @@ async function performCheckin(env) {
     console.log(`\n=== 处理账户 ${i + 1}: ${user} ===`);
 
     try {
-      // 尝试使用现有 Cookie 签到
       let cookie = existingCookie;
       let loginAttempted = false;
 
@@ -254,10 +263,9 @@ async function performCheckin(env) {
         }
       }
 
-      // 需要登录
       if (!cookie || loginAttempted) {
         console.log('开始登录流程...');
-        const loginResult = await sessionLogin(user, password, captchaApiKey, captchaApiUrl);
+        const loginResult = await sessionLogin(user, password, captchaVendor, captchaApiKey, captchaApiUrl);
 
         if (!loginResult.success) {
           throw new Error(loginResult.message);
@@ -266,7 +274,6 @@ async function performCheckin(env) {
         cookie = loginResult.cookie;
         console.log('✅ 登录成功，开始签到...');
 
-        // 使用新 Cookie 签到
         const signResult = await sign(cookie);
 
         if (signResult.success) {
@@ -285,7 +292,6 @@ async function performCheckin(env) {
     }
   }
 
-  // 发送汇总消息到 Telegram
   const successCount = results.filter(r => r.success).length;
   const totalCount = results.length;
   const summaryMsg = `🔔 NodeSeek 签到结果 (${successCount}/${totalCount})\n\n${allMessages.join('\n')}`;
@@ -299,23 +305,14 @@ async function performCheckin(env) {
   };
 }
 
-/**
- * 登录并获取 Cookie
- */
-async function sessionLogin(user, password, captchaApiKey, captchaApiUrl) {
+async function sessionLogin(user, password, vendor, captchaApiKey, captchaApiUrl) {
   try {
-    // 1. 解决验证码
-    console.log('正在使用 2captcha 解决验证码...');
-    const solver = new TwoCaptchaSolver(captchaApiKey, captchaApiUrl);
-
+    const solver = CaptchaSolverFactory.create(vendor, captchaApiKey, captchaApiUrl);
     const token = await solver.solve(
       'https://www.nodeseek.com/signIn.html',
       '0x4AAAAAAAaNy7leGjewpVyR'
     );
 
-    console.log('验证码令牌已获取');
-
-    // 2. 提交登录请求
     const loginData = {
       username: user,
       password: password,
@@ -343,15 +340,13 @@ async function sessionLogin(user, password, captchaApiKey, captchaApiUrl) {
     const data = await response.json();
 
     if (data.success) {
-      // 提取 Cookie
       const setCookieHeaders = response.headers.get('set-cookie') || '';
       let cookie = '';
 
       if (setCookieHeaders) {
-        // 解析 Set-Cookie 头
         const cookies = setCookieHeaders.split(',').map(c => {
           const parts = c.trim().split(';');
-          return parts[0]; // 只取第一部分 (name=value)
+          return parts[0];
         }).join('; ');
         cookie = cookies;
       }
@@ -375,20 +370,12 @@ async function sessionLogin(user, password, captchaApiKey, captchaApiUrl) {
   }
 }
 
-/**
- * 执行签到
- */
 async function sign(cookie) {
   if (!cookie) {
-    return {
-      success: false,
-      needLogin: true,
-      message: '无有效Cookie'
-    };
+    return { success: false, needLogin: true, message: '无有效Cookie' };
   }
 
   try {
-    // 生成随机数
     const random = Math.random().toString(36).substring(2, 15);
 
     const response = await fetch(`https://www.nodeseek.com/api/attendance?random=${random}`, {
@@ -410,43 +397,21 @@ async function sign(cookie) {
     const data = await response.json();
     const msg = data.message || '';
 
-    // 判断签到结果
     if (msg.includes('鸡腿') || data.success) {
-      return {
-        success: true,
-        needLogin: false,
-        message: msg
-      };
+      return { success: true, needLogin: false, message: msg };
     } else if (msg.includes('已完成签到')) {
-      return {
-        success: true,
-        needLogin: false,
-        message: msg
-      };
+      return { success: true, needLogin: false, message: msg };
     } else if (data.status === 404 || msg.includes('请先登录')) {
-      return {
-        success: false,
-        needLogin: true,
-        message: 'Cookie已失效'
-      };
+      return { success: false, needLogin: true, message: 'Cookie已失效' };
     } else {
       throw new Error(msg || '签到失败');
     }
   } catch (error) {
     console.error(`❌ 签到失败: ${error.message}`);
-    return {
-      success: false,
-      needLogin: false,
-      message: error.message
-    };
+    return { success: false, needLogin: false, message: error.message };
   }
 }
 
-// ==================== Telegram 通知 ====================
-
-/**
- * 发送 Telegram 消息
- */
 async function sendTelegramMessage(message, botToken, chatId) {
   if (!chatId) {
     console.log('未配置 ChatID，跳过 Telegram 通知');
@@ -456,37 +421,21 @@ async function sendTelegramMessage(message, botToken, chatId) {
   const now = new Date();
   const formattedTime = now.toLocaleString('zh-CN', {
     timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit'
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
 
   const fullMessage = `执行时间: ${formattedTime}\n\n${message}`;
 
   try {
-    let url;
-    if (botToken && botToken.trim() !== '') {
-      // 使用官方 Telegram API
-      url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    } else {
-      // 使用第三方代理服务（不推荐）
-      console.log('⚠️ 未配置 BotToken，使用第三方代理服务');
-      url = `https://api.tg.090227.xyz/sendMessage`;
-    }
+    let url = botToken && botToken.trim() !== '' 
+      ? `https://api.telegram.org/bot${botToken}/sendMessage`
+      : `https://api.tg.090227.xyz/sendMessage`;
 
     const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: fullMessage,
-        parse_mode: 'HTML'
-      })
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: fullMessage, parse_mode: 'HTML' })
     });
 
     if (response.ok) {
