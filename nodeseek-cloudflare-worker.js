@@ -27,7 +27,6 @@ async function handleRequest(request, env, ctx) {
   if (url.pathname === '/checkin' && request.method === 'POST') {
     // === 新增鉴权逻辑 ===
     const expectedToken = env.AUTH_TOKEN;
-    // 如果你在后台配置了 AUTH_TOKEN，则进行校验
     if (expectedToken && expectedToken.trim() !== '') {
       const clientToken = request.headers.get('Authorization');
       if (clientToken !== expectedToken) {
@@ -37,7 +36,6 @@ async function handleRequest(request, env, ctx) {
         });
       }
     }
-    // ====================
 
     // 鉴权通过，执行签到
     const result = await performCheckin(env);
@@ -176,7 +174,8 @@ class YesCaptchaSolver {
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const result = await response.json();
-        if (result.errorId !== 0) throw new Error(`API错误 (${result.errorId}): ${result.errorDescription || '未知错误' });
+        // === 修复此处未闭合的字符串语法错误 ===
+        if (result.errorId !== 0) throw new Error(`API错误 (${result.errorId}): ${result.errorDescription || '未知错误'}`);
         
         if (result.status === 'ready') {
           const token = result.solution?.token;
@@ -201,7 +200,8 @@ class YesCaptchaSolver {
 // ==================== NodeSeek 签到逻辑 ====================
 async function performCheckin(env) {
   const users = env.user || '';
-  const passwords = env.pass || '';
+  // === 修复 pass 关键字规避问题 ===
+  const passwords = env['pass'] || ''; 
   const captchaVendor = env.CAPTCHA_VENDOR || '2captcha';
   const captchaApiKey = env.CAPTCHA_API_KEY || '';
   const captchaApiUrl = env.CAPTCHA_API_URL || '';
@@ -340,15 +340,15 @@ async function sessionLogin(user, password, vendor, captchaApiKey, captchaApiUrl
     const data = await response.json();
 
     if (data.success) {
-      const setCookieHeaders = response.headers.get('set-cookie') || '';
+      // === 修复多 Cookie 提取失效漏洞 ===
       let cookie = '';
-
-      if (setCookieHeaders) {
-        const cookies = setCookieHeaders.split(',').map(c => {
-          const parts = c.trim().split(';');
-          return parts[0];
-        }).join('; ');
-        cookie = cookies;
+      if (typeof response.headers.getSetCookie === 'function') {
+        cookie = response.headers.getSetCookie().map(c => c.split(';')[0]).join('; ');
+      } else {
+        const setCookieHeaders = response.headers.get('set-cookie') || '';
+        if (setCookieHeaders) {
+          cookie = setCookieHeaders.split(',').map(c => c.trim().split(';')[0]).join('; ');
+        }
       }
 
       console.log(`✅ 登录成功: ${data.message || '登录成功'}`);
@@ -435,7 +435,8 @@ async function sendTelegramMessage(message, botToken, chatId) {
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: fullMessage, parse_mode: 'HTML' })
+      // === 移除或修改 parse_mode 防止因特殊报错字符被 TG 拦截 ===
+      body: JSON.stringify({ chat_id: chatId, text: fullMessage }) 
     });
 
     if (response.ok) {
