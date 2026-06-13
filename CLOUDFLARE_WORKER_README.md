@@ -79,13 +79,15 @@ wrangler deploy
 |--------|------|------|
 | `user` | NodeSeek 用户名（多个用`&`分隔） | `user1&user2` |
 | `pass` | 密码（多个用`&`分隔，与user对应） | `pass1&pass2` |
-| `CAPTCHA_API_KEY` | 2captcha API密钥 | `abc123def456...` |
+| `CAPTCHA_VENDOR` | 验证码供应商（填 `yescaptcha` 或 `2captcha`） | `yescaptcha` |
+| `CAPTCHA_API_KEY` | 对应验证码平台的 API 密钥 / ClientKey | `abc123def456...` |
 
 #### 可选环境变量
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `CAPTCHA_API_URL` | 2captcha API地址 | `https://api.2captcha.com` |
+| `CAPTCHA_API_URL` | 验证码 API 地址（留空则根据供应商自动选择） | - |
+| `AUTH_TOKEN` | 用于保护手动接口的安全鉴权 Token（推荐配置） | - |
 | `NS_COOKIE` | 已有的Cookie（可选，多个用`&`分隔） | - |
 | `BotToken` | Telegram Bot Token | - |
 | `ChatID` | Telegram Chat ID | - |
@@ -95,7 +97,9 @@ wrangler deploy
 ```
 user: alice&bob
 pass: password123&password456
+CAPTCHA_VENDOR: yescaptcha
 CAPTCHA_API_KEY: 1234567890abcdef1234567890abcdef
+AUTH_TOKEN: MySecretToken123
 BotToken: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 ChatID: 123456789
 ```
@@ -103,7 +107,10 @@ ChatID: 123456789
 **注意事项：**
 - `user` 和 `pass` 的数量必须一一对应
 - 如果提供了 `NS_COOKIE`，会先尝试使用 Cookie 签到，失败后才会登录
-- 2captcha 服务需要付费，请确保账户有足够余额
+- 验证码服务需要付费，请确保对应账户有足够余额
+- **如果配置了 `AUTH_TOKEN`，手动触发 HTTP POST 接口时必须在 Header 中携带此令牌。**
+
+
 
 ### 4. 设置定时任务
 
@@ -136,12 +143,14 @@ ChatID: 123456789
 - `0 */6 * * *` - 每6小时一次
 - `0 8,20 * * *` - 每天上午8点和晚上8点
 
+
 ### 5. 手动触发签到
 
-你可以通过 HTTP POST 请求手动触发签到：
+你可以通过 HTTP POST 请求手动触发签到。如果你在环境变量中配置了 `AUTH_TOKEN`，请在 Headers 中带上 `Authorization` 字段进行鉴权：
 
 ```bash
-curl -X POST https://your-worker-name.your-subdomain.workers.dev/checkin
+curl -X POST [https://your-worker-name.your-subdomain.workers.dev/checkin](https://your-worker-name.your-subdomain.workers.dev/checkin) \
+  -H "Authorization: 你的AUTH_TOKEN"
 ```
 
 ## 工作原理
@@ -258,6 +267,12 @@ curl -X POST https://your-worker-name.your-subdomain.workers.dev/checkin
 ## 成本估算
 
 假设每天签到 2 个账号：
+
+- **(新增) yescaptcha 费用**：
+  - ￥0.025每次
+  - 首充无限制（￥1)
+  - 本worker已原生集成 YesCaptcha 验证码识别功能。如果你觉得好用，欢迎通过我的 [YesCaptcha](https://yescaptcha.com/i/rX0lOa
+) 推广链接注册，这能为我持续维护和更新此 Fork 分支提供动力。
 
 - **2captcha 费用**：
   - 每次登录需要解决 1 次验证码
